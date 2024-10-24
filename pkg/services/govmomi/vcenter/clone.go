@@ -138,10 +138,11 @@ func Clone(ctx context.Context, vmCtx *capvcontext.VMContext, bootstrapData []by
 
 	// Only non-linked clones may expand the size of the template's disk.
 	if snapshotRef == nil {
-		diskSpecs, err := getDiskSpec(vmCtx, devices)
+		diskSpecs, err := getDiskSpec(ctx, vmCtx, devices)
 		if err != nil {
 			return errors.Wrapf(err, "error getting disk spec for %q", ctx)
 		}
+		log.Info("Got the following disks", "disk", diskSpecs)
 		deviceSpecs = append(deviceSpecs, diskSpecs...)
 	}
 
@@ -334,14 +335,16 @@ func getDiskLocators(disks object.VirtualDeviceList, datastoreRef types.ManagedO
 	return diskLocators
 }
 
-func getDiskSpec(vmCtx *capvcontext.VMContext, devices object.VirtualDeviceList) ([]types.BaseVirtualDeviceConfigSpec, error) {
+func getDiskSpec(ctx context.Context, vmCtx *capvcontext.VMContext, devices object.VirtualDeviceList) ([]types.BaseVirtualDeviceConfigSpec, error) {
+	log := ctrl.LoggerFrom(ctx)
+
 	disks := devices.SelectByType((*types.VirtualDisk)(nil))
 	if len(disks) == 0 {
 		return nil, errors.Errorf("Invalid disk count: %d", len(disks))
 	}
 
 	// There is at least one disk
-	var diskSpecs []types.BaseVirtualDeviceConfigSpec
+	diskSpecs := []types.BaseVirtualDeviceConfigSpec{}
 	primaryDisk := disks[0].(*types.VirtualDisk)
 	primaryCloneCapacityKB := int64(vmCtx.VSphereVM.Spec.DiskGiB) * 1024 * 1024
 	primaryDiskConfigSpec, err := getDiskConfigSpec(primaryDisk, primaryCloneCapacityKB)
@@ -369,6 +372,17 @@ func getDiskSpec(vmCtx *capvcontext.VMContext, devices object.VirtualDeviceList)
 			diskSpecs = append(diskSpecs, additionalDiskConfigSpec)
 		}
 	}
+
+	// Process all DataDisks definitions to dynamically create and add disks to the VM
+	if len(vmCtx.VSphereVM.Spec.DataDisks) > 0 {
+		additionalDisks, err := createDataDisks(ctx, vmCtx.VSphereVM.Spec.DataDisks, primaryDisk, devices)
+		if err != nil {
+			log.Error(err, "Unable to add additional disks.")
+			return nil, err
+		}
+		diskSpecs = append(diskSpecs, additionalDisks...)
+	}
+
 	return diskSpecs, nil
 }
 
@@ -388,6 +402,103 @@ func getDiskConfigSpec(disk *types.VirtualDisk, diskCloneCapacityKB int64) (type
 		Operation: types.VirtualDeviceConfigSpecOperationEdit,
 		Device:    disk,
 	}, nil
+}
+
+// createDataDisks parses through the list of VSphereDisk objects and generates the VirtualDeviceConfigSpec for each one.
+func createDataDisks(ctx context.Context, disks []infrav1.VSphereDisk, primaryDisk *types.VirtualDisk, devices object.VirtualDeviceList) ([]types.BaseVirtualDeviceConfigSpec, error) {
+	log := ctrl.LoggerFrom(ctx)
+	additionalDisks := []types.BaseVirtualDeviceConfigSpec{}
+	unit := int32(1)
+
+	for i, dataDisk := range disks {
+		log.Info("Adding disk", "spec", dataDisk)
+
+		// Get the controller of the primary disk.
+		controller, ok := devices.FindByKey(primaryDisk.ControllerKey).(types.BaseVirtualController)
+		if !ok {
+			return nil, errors.Errorf("unable to find controller with key=%v", primaryDisk.ControllerKey)
+		}
+
+		dev := &types.VirtualDisk{
+			VirtualDevice: types.VirtualDevice{
+				Key: devices.NewKey() - int32(i),
+				Backing: &types.VirtualDiskFlatVer2BackingInfo{
+					DiskMode:        string(types.VirtualDiskModePersistent),
+					ThinProvisioned: types.NewBool(true),
+					VirtualDeviceFileBackingInfo: types.VirtualDeviceFileBackingInfo{
+						FileName: "",
+					},
+				},
+				ControllerKey: controller.GetVirtualController().Key,
+			},
+			CapacityInKB: int64(dataDisk.SizeGiB) * 1024 * 1024,
+		}
+
+		// Assign unit number to the next slot on the controller.
+		assignUnitNumber(ctx, dev, devices, additionalDisks, controller, unit)
+		unit = *dev.UnitNumber
+
+		diskConfigSpec := types.VirtualDeviceConfigSpec{
+			Device:        dev,
+			Operation:     types.VirtualDeviceConfigSpecOperationAdd,
+			FileOperation: types.VirtualDeviceConfigSpecFileOperationCreate,
+		}
+
+		log.Info("Generated device", "dev", dev)
+
+		additionalDisks = append(additionalDisks, &diskConfigSpec)
+	}
+
+	return additionalDisks, nil
+}
+
+// assignUnitNumber assigns a controller unit number to a device.
+func assignUnitNumber(ctx context.Context, device types.BaseVirtualDevice, existingDevices object.VirtualDeviceList, newDevices []types.BaseVirtualDeviceConfigSpec, controller types.BaseVirtualController, offset int32) {
+	log := ctrl.LoggerFrom(ctx)
+	vd := device.GetVirtualDevice()
+	vd.ControllerKey = controller.GetVirtualController().Key
+	vd.UnitNumber = &offset
+
+	units := make([]bool, 30)
+
+	for i := 0; i < int(offset); i++ {
+		units[i] = true
+	}
+
+	sc, ok := controller.(types.BaseVirtualSCSIController)
+	if ok {
+		//  The SCSI controller sits on its own bus
+		log.V(4).Info(fmt.Sprintf("Marking SCSI Controller's unit number: %d", sc.GetVirtualSCSIController().ScsiCtlrUnitNumber))
+		units[sc.GetVirtualSCSIController().ScsiCtlrUnitNumber] = true
+	}
+
+	key := controller.GetVirtualController().Key
+
+	// Check all existing devices
+	for _, device := range existingDevices {
+		d := device.GetVirtualDevice()
+		if d.ControllerKey == key && d.UnitNumber != nil {
+			units[int(*d.UnitNumber)] = true
+		}
+	}
+
+	// Check new devices
+	for _, device := range newDevices {
+		d := device.GetVirtualDeviceConfigSpec().Device.GetVirtualDevice()
+		if d.ControllerKey == key && d.UnitNumber != nil {
+			units[int(*d.UnitNumber)] = true
+		}
+	}
+
+	// Assign first unused unit number
+	for unit, used := range units {
+		if !used {
+			unit32 := int32(unit)
+			vd.UnitNumber = &unit32
+			log.V(4).Info(fmt.Sprintf("Determined next available unit number: %d", unit32))
+			break
+		}
+	}
 }
 
 const ethCardType = "vmxnet3"
